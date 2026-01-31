@@ -2,6 +2,24 @@ export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(main(env));
   },
+
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const token = url.searchParams.get("token");
+
+    if (!env.INGEST_TOKEN || token !== env.INGEST_TOKEN) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    try {
+      await main(env);
+      return new Response("OK", { status: 200 });
+    } catch (e) {
+      return new Response(e instanceof Error ? e.message : String(e), {
+        status: 500,
+      });
+    }
+  },
 };
 
 async function main(env) {
