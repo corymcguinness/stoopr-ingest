@@ -12,45 +12,76 @@ async function main(env) {
     "CSV_URL_LISTINGS",
     "CSV_URL_INTEL",
   ];
+
   for (const k of required) {
     if (!env[k]) throw new Error(`Missing env var: ${k}`);
   }
 
-  // Run all ingests, log each one to Supabase
+  // 🔔 HEARTBEAT: guarantees at least one row per run
+  await supabaseInsert(env, "ingest_runs", [
+    {
+      source: "heartbeat",
+      status: "ok",
+      detail: "scheduled run started",
+      counts: {},
+      ran_at: new Date().toISOString(),
+    },
+  ]);
+
+  // Run all ingests, each logs ok/error into ingest_runs
   await runAndLog(env, "buildings", ingestBuildings);
   await runAndLog(env, "listings", ingestListings);
   await runAndLog(env, "intel_current", ingestIntel);
-
-  return { ok: true };
 }
 
+/** -----------------------------
+ *  Runner + logging
+ * ----------------------------- */
 async function runAndLog(env, source, fn) {
   const started = new Date().toISOString();
+
   try {
     const result = await fn(env);
+
     await logRun(env, {
       source,
       status: "ok",
       detail: `ok @ ${started}`,
       counts: result || {},
     });
+
+    return result;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+
     await logRun(env, {
       source,
       status: "error",
       detail: msg.slice(0, 2000),
       counts: { started },
     });
-    // Re-throw so Cloudflare marks the run as failed too
-    throw err;
+
+    throw err; // ensures Cloudflare marks the run as failed too
   }
+}
+
+async function logRun(env, { source, status, detail, counts }) {
+  await supabaseInsert(env, "ingest_runs", [
+    {
+      source,
+      status,
+      detail: detail || null,
+      counts: counts || {},
+      ran_at: new Date().toISOString(),
+    },
+  ]);
 }
 
 /** -----------------------------
  *  INGEST: BUILDINGS
  *  CSV columns:
  *  neighborhood_id,bbl,address_norm,address_display,lat,lng
+ *  Upsert key: bbl
  * ----------------------------- */
 async function ingestBuildings(env) {
   const csvText = await fetchText(env.CSV_URL_BUILDINGS);
@@ -61,7 +92,7 @@ async function ingestBuildings(env) {
     .map((r) => ({
       neighborhood_id: r.neighborhood_id,
       bbl: String(r.bbl),
-      address_norm: r.address_norm || r.address_display.toLowerCase(),
+      address_norm: r.address_norm || String(r.address_display).toLowerCase(),
       address_display: r.address_display,
       lat: r.lat ? toNumberOrNull(r.lat) : null,
       lng: r.lng ? toNumberOrNull(r.lng) : null,
@@ -93,7 +124,7 @@ async function ingestListings(env) {
       ask_price: r.ask_price ? toNumberOrNull(r.ask_price) : null,
       listed_at: r.listed_at ? toIsoOrNull(r.listed_at) : null,
       raw: r.raw ? toJsonOrEmpty(r.raw) : {},
-      // keep url in sync (your schema has both)
+      // optional: keep legacy url in sync if the column exists
       url: r.source_url,
     }));
 
@@ -132,22 +163,7 @@ async function ingestIntel(env) {
 }
 
 /** -----------------------------
- *  LOGGING: ingest_runs
- * ----------------------------- */
-async function logRun(env, { source, status, detail, counts }) {
-  await supabaseInsert(env, "ingest_runs", [
-    {
-      source,
-      status,
-      detail: detail || null,
-      counts: counts || {},
-      ran_at: new Date().toISOString(),
-    },
-  ]);
-}
-
-/** -----------------------------
- *  SUPABASE REST helpers
+ *  Supabase REST helpers
  * ----------------------------- */
 async function supabaseUpsert(env, table, records, onConflict) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?on_conflict=${encodeURIComponent(
@@ -167,7 +183,9 @@ async function supabaseUpsert(env, table, records, onConflict) {
 
   if (!res.ok) {
     const body = await safeText(res);
-    throw new Error(`Supabase upsert failed (${table}): ${res.status} ${res.statusText}\n${body}`);
+    throw new Error(
+      `Supabase upsert failed (${table}): ${res.status} ${res.statusText}\n${body}`
+    );
   }
 }
 
@@ -187,7 +205,9 @@ async function supabaseInsert(env, table, records) {
 
   if (!res.ok) {
     const body = await safeText(res);
-    throw new Error(`Supabase insert failed (${table}): ${res.status} ${res.statusText}\n${body}`);
+    throw new Error(
+      `Supabase insert failed (${table}): ${res.status} ${res.statusText}\n${body}`
+    );
   }
 }
 
@@ -220,9 +240,11 @@ function parseCsv(text) {
     }
     out.push(row);
   }
+
   return out;
 }
 
+// Handles quoted CSV values with commas.
 function splitCsvLine(line) {
   const result = [];
   let cur = "";
@@ -253,7 +275,7 @@ function splitCsvLine(line) {
 }
 
 /** -----------------------------
- *  Small coercion helpers
+ *  Coercion helpers
  * ----------------------------- */
 function toNumberOrNull(v) {
   const n = Number(String(v).replace(/[$,]/g, ""));
@@ -272,8 +294,7 @@ function toIsoOrNull(v) {
 
 function toJsonOrEmpty(v) {
   try {
-    const parsed = JSON.parse(v);
-    return parsed ?? {};
+    return JSON.parse(v) ?? {};
   } catch {
     return {};
   }
