@@ -1,0 +1,4 @@
+bbl,source,source_url,status,ask_price,listed_at,raw
+3007890012,seed,https://example.com/listing/3007890012,active,2150000,2026-01-28T12:00:00Z,"{""note"":""seed listing""}"
+3001230045,seed,https://example.com/listing/3001230045,active,1895000,2026-01-23T12:00:00Z,"{""note"":""seed listing""}"
+3004560078,seed,https://example.com/listing/3004560078,active,2425000,2026-01-30T12:00:00Z,"{""note"":""seed listing""}"
