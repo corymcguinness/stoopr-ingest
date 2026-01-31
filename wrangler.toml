@@ -1,0 +1,6 @@
+name = "stoopr-ingest"
+main = "src/index.js"
+compatibility_date = "2026-01-31"
+
+[triggers]
+crons = ["0 7 * * *"]
