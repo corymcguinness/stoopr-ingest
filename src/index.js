@@ -12,8 +12,11 @@ export default {
     }
 
     try {
-      await main(env);
-      return new Response("OK", { status: 200 });
+      const result = await main(env);
+      return new Response(JSON.stringify(result, null, 2), {
+        status: 200,
+        headers: { "content-type": "application/json; charset=utf-8" },
+      });
     } catch (e) {
       return new Response(e instanceof Error ? e.message : String(e), {
         status: 500,
@@ -29,6 +32,7 @@ async function main(env) {
     "CSV_URL_BUILDINGS",
     "CSV_URL_LISTINGS",
     "CSV_URL_INTEL",
+    "PLUTO_URL",
   ];
 
   for (const k of required) {
@@ -46,10 +50,17 @@ async function main(env) {
     },
   ]);
 
-  // Run all ingests, each logs ok/error into ingest_runs
-  await runAndLog(env, "buildings", ingestBuildings);
-  await runAndLog(env, "listings", ingestListings);
-  await runAndLog(env, "intel_current", ingestIntel);
+  const out = {};
+
+  // 0) PLUTO (Brooklyn) staged into pluto_raw (paged + resumable)
+  out.pluto_raw = await runAndLog(env, "pluto_raw", ingestPlutoBrooklyn);
+
+  // 1) Your existing CSV ingests
+  out.buildings = await runAndLog(env, "buildings", ingestBuildings);
+  out.listings = await runAndLog(env, "listings", ingestListings);
+  out.intel_current = await runAndLog(env, "intel_current", ingestIntel);
+
+  return { ok: true, ...out };
 }
 
 /** -----------------------------
@@ -93,6 +104,79 @@ async function logRun(env, { source, status, detail, counts }) {
       ran_at: new Date().toISOString(),
     },
   ]);
+}
+
+/** -----------------------------
+ *  INGEST: PLUTO (BROOKLYN)
+ *  Writes into pluto_raw
+ *  Resumes using ingest_state.cursor = { offset: number }
+ * ----------------------------- */
+async function ingestPlutoBrooklyn(env) {
+  const state = await getIngestState(env, "pluto_raw");
+  let offset = Number(state?.cursor?.offset || 0);
+
+  const limit = 5000;
+
+  // per-run cap so we don't time out; increase later if you want
+  const maxPagesThisRun = 5;
+
+  let pages = 0;
+  let total = 0;
+
+  while (pages < maxPagesThisRun) {
+    const url =
+      `${env.PLUTO_URL}` +
+      `?$select=bbl,borough,zipcode,bldgclass,landuse,yearbuilt,numfloors,unitsres,address` +
+      `&$where=borough='BK'` +
+      `&$limit=${limit}` +
+      `&$offset=${offset}`;
+
+    const rows = await fetchJson(url, env);
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      // done — reset offset so a future run can start over if you want
+      await setIngestState(env, "pluto_raw", { offset }, true);
+      return { upserted_pluto_rows: total, pages, offset, done: true };
+    }
+
+    const records = rows
+      .filter((r) => r.bbl)
+      .map((r) => ({
+        bbl: String(r.bbl),
+        borough: r.borough || null,
+        zipcode: r.zipcode || null,
+        bldgclass: r.bldgclass || null,
+        landuse: r.landuse != null ? parseInt(String(r.landuse), 10) : null,
+        yearbuilt: r.yearbuilt != null ? parseInt(String(r.yearbuilt), 10) : null,
+        numfloors: r.numfloors != null ? Number(r.numfloors) : null,
+        unitsres: r.unitsres != null ? parseInt(String(r.unitsres), 10) : null,
+        address: r.address || null,
+        raw: r,
+        ingested_at: new Date().toISOString(),
+      }));
+
+    if (records.length) {
+      await supabaseUpsert(env, "pluto_raw", records, "bbl");
+      total += records.length;
+    }
+
+    offset += limit;
+    pages += 1;
+
+    // persist cursor after each page so it's truly resumable
+    await setIngestState(env, "pluto_raw", { offset }, false);
+  }
+
+  return { upserted_pluto_rows: total, pages, offset, done: false };
+}
+
+async function fetchJson(url, env) {
+  const headers = { "user-agent": "stoopr-ingest/1.0" };
+  if (env.SOCRATA_APP_TOKEN) headers["X-App-Token"] = env.SOCRATA_APP_TOKEN;
+
+  const res = await fetch(url, { headers });
+  if (!res.ok) throw new Error(`PLUTO fetch failed: ${res.status} ${res.statusText}`);
+  return await res.json();
 }
 
 /** -----------------------------
@@ -142,7 +226,6 @@ async function ingestListings(env) {
       ask_price: r.ask_price ? toNumberOrNull(r.ask_price) : null,
       listed_at: r.listed_at ? toIsoOrNull(r.listed_at) : null,
       raw: r.raw ? toJsonOrEmpty(r.raw) : {},
-      // optional: keep legacy url in sync if the column exists
       url: r.source_url,
     }));
 
@@ -178,6 +261,42 @@ async function ingestIntel(env) {
 
   await supabaseUpsert(env, "intel_current", intel, "bbl");
   return { upserted_intel: intel.length };
+}
+
+/** -----------------------------
+ *  ingest_state helpers (cursor)
+ * ----------------------------- */
+async function getIngestState(env, source) {
+  const url = `${env.SUPABASE_URL}/rest/v1/ingest_state?source=eq.${encodeURIComponent(
+    source
+  )}&select=source,cursor,updated_at`;
+
+  const res = await fetch(url, {
+    headers: {
+      apikey: env.SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY}`,
+    },
+  });
+
+  if (!res.ok) {
+    const body = await safeText(res);
+    throw new Error(`Supabase read failed (ingest_state): ${res.status} ${res.statusText}\n${body}`);
+  }
+
+  const rows = await res.json();
+  return rows?.[0] || null;
+}
+
+async function setIngestState(env, source, cursor, reset) {
+  const payload = [
+    {
+      source,
+      cursor: reset ? {} : cursor,
+      updated_at: new Date().toISOString(),
+    },
+  ];
+
+  await supabaseUpsert(env, "ingest_state", payload, "source");
 }
 
 /** -----------------------------
@@ -262,7 +381,6 @@ function parseCsv(text) {
   return out;
 }
 
-// Handles quoted CSV values with commas.
 function splitCsvLine(line) {
   const result = [];
   let cur = "";
