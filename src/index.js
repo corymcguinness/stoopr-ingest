@@ -29,9 +29,6 @@ async function main(env) {
   const required = [
     "SUPABASE_URL",
     "SUPABASE_SERVICE_ROLE_KEY",
-    "CSV_URL_BUILDINGS",
-    "CSV_URL_LISTINGS",
-    "CSV_URL_INTEL",
     "PLUTO_URL",
     "DOB_PERMITS_URL",
   ];
@@ -56,15 +53,8 @@ async function main(env) {
   // 0) PLUTO (Brooklyn) staged into pluto_raw (paged + resumable)
   out.pluto_raw = await runAndLog(env, "pluto_raw", ingestPlutoBrooklyn);
 
-  // 1) Buildings from your CSV
-  out.buildings = await runAndLog(env, "buildings", ingestBuildings);
-
   // 2) DOB permits (Brooklyn) into dob_permits (paged + resumable)
   out.dob_permits = await runAndLog(env, "dob_permits", ingestDobPermitsBrooklyn);
-
-  // 3) Listings + intel from your CSVs
-  out.listings = await runAndLog(env, "listings", ingestListings);
-  out.intel_current = await runAndLog(env, "intel_current", ingestIntel);
 
   return { ok: true, ...out };
 }
