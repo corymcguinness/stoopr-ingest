@@ -33,6 +33,7 @@ async function main(env) {
     "CSV_URL_LISTINGS",
     "CSV_URL_INTEL",
     "PLUTO_URL",
+    "DOB_PERMITS_URL",
   ];
 
   for (const k of required) {
@@ -55,8 +56,13 @@ async function main(env) {
   // 0) PLUTO (Brooklyn) staged into pluto_raw (paged + resumable)
   out.pluto_raw = await runAndLog(env, "pluto_raw", ingestPlutoBrooklyn);
 
-  // 1) Your existing CSV ingests
+  // 1) Buildings from your CSV
   out.buildings = await runAndLog(env, "buildings", ingestBuildings);
+
+  // 2) DOB permits (Brooklyn) into dob_permits (paged + resumable)
+  out.dob_permits = await runAndLog(env, "dob_permits", ingestDobPermitsBrooklyn);
+
+  // 3) Listings + intel from your CSVs
   out.listings = await runAndLog(env, "listings", ingestListings);
   out.intel_current = await runAndLog(env, "intel_current", ingestIntel);
 
@@ -116,8 +122,6 @@ async function ingestPlutoBrooklyn(env) {
   let offset = Number(state?.cursor?.offset || 0);
 
   const limit = 5000;
-
-  // per-run cap so we don't time out; increase later if you want
   const maxPagesThisRun = 5;
 
   let pages = 0;
@@ -134,7 +138,6 @@ async function ingestPlutoBrooklyn(env) {
     const rows = await fetchJson(url, env);
 
     if (!Array.isArray(rows) || rows.length === 0) {
-      // done — reset offset so a future run can start over if you want
       await setIngestState(env, "pluto_raw", { offset }, true);
       return { upserted_pluto_rows: total, pages, offset, done: true };
     }
@@ -163,19 +166,94 @@ async function ingestPlutoBrooklyn(env) {
     offset += limit;
     pages += 1;
 
-    // persist cursor after each page so it's truly resumable
     await setIngestState(env, "pluto_raw", { offset }, false);
   }
 
   return { upserted_pluto_rows: total, pages, offset, done: false };
 }
 
+/** -----------------------------
+ *  INGEST: DOB PERMITS (BROOKLYN)
+ *  Writes into dob_permits
+ *  Resumes using ingest_state.cursor = { offset: number }
+ *
+ *  DOB_PERMITS_URL should be:
+ *   https://data.cityofnewyork.us/resource/ic3t-wcy2.json
+ * ----------------------------- */
+async function ingestDobPermitsBrooklyn(env) {
+  const state = await getIngestState(env, "dob_permits");
+  let offset = Number(state?.cursor?.offset || 0);
+
+  const limit = 5000;
+  const maxPagesThisRun = 5;
+
+  let pages = 0;
+  let total = 0;
+
+  while (pages < maxPagesThisRun) {
+    const url =
+      `${env.DOB_PERMITS_URL}` +
+      `?$select=:id,bbl,borough,block,lot,job_type,job_status,latest_action_date` +
+      `&$where=borough='BROOKLYN'` +
+      `&$limit=${limit}` +
+      `&$offset=${offset}`;
+
+    const rows = await fetchJson(url, env);
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      await setIngestState(env, "dob_permits", { offset }, true);
+      return { upserted_dob_rows: total, pages, offset, done: true };
+    }
+
+    const records = rows
+      .map((r) => {
+        const bbl =
+          r.bbl
+            ? String(r.bbl)
+            : r.block && r.lot
+              ? `3${String(r.block).padStart(5, "0")}${String(r.lot).padStart(4, "0")}`
+              : null;
+
+        const sourceId = r[":id"] ? `ic3t-wcy2:${r[":id"]}` : null;
+
+        return {
+          source_id: sourceId,
+          bbl,
+          filed_date: r.latest_action_date ? String(r.latest_action_date).slice(0, 10) : null,
+          job_type: r.job_type || null,
+          status: r.job_status || null,
+          source: "dob_job_applications",
+          raw: r,
+          ingested_at: new Date().toISOString(),
+        };
+      })
+      .filter((x) => x.source_id && x.bbl);
+
+    if (records.length) {
+      await supabaseUpsert(env, "dob_permits", records, "source_id");
+      total += records.length;
+    }
+
+    offset += limit;
+    pages += 1;
+
+    await setIngestState(env, "dob_permits", { offset }, false);
+  }
+
+  return { upserted_dob_rows: total, pages, offset, done: false };
+}
+
+/** -----------------------------
+ *  Fetch JSON (Socrata token support)
+ * ----------------------------- */
 async function fetchJson(url, env) {
   const headers = { "user-agent": "stoopr-ingest/1.0" };
   if (env.SOCRATA_APP_TOKEN) headers["X-App-Token"] = env.SOCRATA_APP_TOKEN;
 
   const res = await fetch(url, { headers });
-  if (!res.ok) throw new Error(`PLUTO fetch failed: ${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    throw new Error(`Fetch failed: ${res.status} ${res.statusText}`);
+  }
   return await res.json();
 }
 
@@ -280,7 +358,9 @@ async function getIngestState(env, source) {
 
   if (!res.ok) {
     const body = await safeText(res);
-    throw new Error(`Supabase read failed (ingest_state): ${res.status} ${res.statusText}\n${body}`);
+    throw new Error(
+      `Supabase read failed (ingest_state): ${res.status} ${res.statusText}\n${body}`
+    );
   }
 
   const rows = await res.json();
